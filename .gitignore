@@ -5,6 +5,11 @@ __pycache__/
 # C extensions
 *.so
 
+# Codex instructions
+AGENTS.md
+
+.text2audio/
+
 # Distribution / packaging
 .Python
 build/
