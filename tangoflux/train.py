@@ -10,7 +10,6 @@ import diffusers
 import datasets
 import numpy as np
 import pandas as pd
-import wandb
 import transformers
 import torch
 from accelerate import Accelerator
@@ -20,14 +19,45 @@ from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 from transformers import SchedulerType, get_scheduler
-from model import TangoFlux
 from datasets import load_dataset, Audio
-from utils import Text2AudioDataset, read_wav_file, pad_wav
+try:
+    from tangoflux.model import TangoFlux
+    from tangoflux.utils import Text2AudioDataset, read_wav_file, pad_wav
+except ImportError:
+    from model import TangoFlux
+    from utils import Text2AudioDataset, read_wav_file, pad_wav
 
 from diffusers import AutoencoderOobleck
 import torchaudio
 
+try:
+    import wandb
+except ImportError:
+    class _WandbStub:
+        class Settings:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        @staticmethod
+        def init(*args, **kwargs):
+            return None
+
+        @staticmethod
+        def log(*args, **kwargs):
+            return None
+
+    wandb = _WandbStub()
+
 logger = get_logger(__name__)
+
+
+def compute_grad_norm(parameters):
+    total_norm = 0.0
+    for parameter in parameters:
+        if parameter.grad is not None:
+            param_norm = parameter.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    return total_norm**0.5
 
 
 def parse_args():
@@ -252,13 +282,13 @@ def main():
 
     ## Freeze vae
     for param in vae.parameters():
-        vae.requires_grad = False
-        vae.eval()
+        param.requires_grad = False
+    vae.eval()
 
     ## Freeze text encoder param
     for param in model.text_encoder.parameters():
         param.requires_grad = False
-        model.text_encoder.eval()
+    model.text_encoder.eval()
 
     prefix = args.prefix
 
@@ -315,22 +345,30 @@ def main():
         collate_fn=test_dataset.collate_fn,
     )
 
-    # Optimizer
-
-    optimizer_parameters = list(model.transformer.parameters()) + list(
-        model.fc.parameters()
-    )
-    num_trainable_parameters = sum(
-        p.numel() for p in model.parameters() if p.requires_grad
-    )
-    accelerator.print("Num trainable parameters: {}".format(num_trainable_parameters))
-
     if args.load_from_checkpoint:
         from safetensors.torch import load_file
 
         w1 = load_file(args.load_from_checkpoint)
         model.load_state_dict(w1, strict=False)
         logger.info("Weights loaded from{}".format(args.load_from_checkpoint))
+
+    # Optimizer
+
+    model.configure_trainable_parameters()
+    if (
+        model.has_commutative_adapter()
+        and model.commutative_adapter_adapter_only
+    ):
+        model.validate_adapter_only_trainable()
+
+    optimizer_parameters = model.get_optimizer_parameters()
+    if len(optimizer_parameters) == 0:
+        raise ValueError("No trainable parameters were selected for optimization.")
+
+    num_trainable_parameters = sum(
+        parameter.numel() for parameter in optimizer_parameters
+    )
+    accelerator.print("Num trainable parameters: {}".format(num_trainable_parameters))
 
     optimizer = torch.optim.AdamW(
         optimizer_parameters,
@@ -418,7 +456,8 @@ def main():
 
     for epoch in range(starting_epoch, num_train_epochs):
         model.train()
-        total_loss, total_val_loss = 0, 0
+        total_loss, total_flow_loss, total_comm_loss = 0, 0, 0
+        total_val_loss, total_val_flow_loss, total_val_comm_loss = 0, 0, 0
         for step, batch in enumerate(train_dataloader):
 
             with accelerator.accumulate(model):
@@ -456,8 +495,12 @@ def main():
                         1, 2
                     )  ## Tranpose  to (bsz, seq_len, channel)
 
-                loss, _, _, _ = model(audio_latent, text, duration=duration)
+                loss, flow_loss, comm_loss, _ = model(
+                    audio_latent, text, duration=duration
+                )
                 total_loss += loss.detach().float()
+                total_flow_loss += flow_loss.detach().float()
+                total_comm_loss += comm_loss.detach().float()
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
@@ -469,20 +512,21 @@ def main():
 
             if completed_steps % 10 == 0 and accelerator.is_main_process:
 
-                total_norm = 0.0
-                for p in model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-
-                total_norm = total_norm**0.5
+                total_norm = compute_grad_norm(model.parameters())
                 logger.info(
-                    f"Step {completed_steps}, Loss: {loss.item()}, Grad Norm: {total_norm}"
+                    "Step %s, Loss: %s, Flow Loss: %s, Comm Loss: %s, Grad Norm: %s",
+                    completed_steps,
+                    loss.item(),
+                    flow_loss.item(),
+                    comm_loss.item(),
+                    total_norm,
                 )
 
                 lr = lr_scheduler.get_last_lr()[0]
                 result = {
                     "train_loss": loss.item(),
+                    "flow_loss": flow_loss.item(),
+                    "comm_loss": comm_loss.item(),
                     "grad_norm": total_norm,
                     "learning_rate": lr,
                 }
@@ -507,7 +551,7 @@ def main():
             range(len(eval_dataloader)), disable=not accelerator.is_local_main_process
         )
         for step, batch in enumerate(eval_dataloader):
-            with accelerator.accumulate(model) and torch.no_grad():
+            with accelerator.accumulate(model), torch.no_grad():
                 device = model.device
                 text, audios, duration, _ = batch
 
@@ -532,9 +576,13 @@ def main():
                     1, 2
                 )  ## Tranpose  to (bsz, seq_len, channel)
 
-                val_loss, _, _, _ = model(audio_latent, text, duration=duration)
+                val_loss, val_flow_loss, val_comm_loss, _ = model(
+                    audio_latent, text, duration=duration
+                )
 
                 total_val_loss += val_loss.detach().float()
+                total_val_flow_loss += val_flow_loss.detach().float()
+                total_val_comm_loss += val_comm_loss.detach().float()
                 eval_progress_bar.update(1)
 
         if accelerator.is_main_process:
@@ -545,8 +593,20 @@ def main():
             result["epoch/train_loss"] = round(
                 total_loss.item() / len(train_dataloader), 4
             )
+            result["epoch/train_flow_loss"] = round(
+                total_flow_loss.item() / len(train_dataloader), 4
+            )
+            result["epoch/train_comm_loss"] = round(
+                total_comm_loss.item() / len(train_dataloader), 4
+            )
             result["epoch/val_loss"] = round(
                 total_val_loss.item() / len(eval_dataloader), 4
+            )
+            result["epoch/val_flow_loss"] = round(
+                total_val_flow_loss.item() / len(eval_dataloader), 4
+            )
+            result["epoch/val_comm_loss"] = round(
+                total_val_comm_loss.item() / len(eval_dataloader), 4
             )
 
             wandb.log(result, step=completed_steps)

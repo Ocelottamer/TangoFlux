@@ -152,6 +152,17 @@ class TangoFlux(nn.Module):
         self.max_duration = config.get("max_duration", 30)
         self.uncondition = config.get("uncondition", False)
         self.text_encoder_name = config.get("text_encoder_name", "google/flan-t5-large")
+        commutative_adapter_config = config.get("commutative_adapter", {})
+        self.commutative_adapter_enabled = commutative_adapter_config.get(
+            "enabled", False
+        )
+        self.commutative_adapter_adapter_only = commutative_adapter_config.get(
+            "adapter_only", True
+        )
+        self.commutative_adapter_residual_scale = commutative_adapter_config.get(
+            "residual_scale", 0.1
+        )
+        self.lambda_comm = commutative_adapter_config.get("lambda_comm", 1e-4)
 
         self.noise_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
         self.noise_scheduler_copy = copy.deepcopy(self.noise_scheduler)
@@ -182,7 +193,103 @@ class TangoFlux(nn.Module):
             guidance_embeds=False,
         )
 
+        if self.commutative_adapter_enabled:
+            self.commutator_A_t = nn.Linear(
+                self.in_channels, self.in_channels, bias=False
+            )
+            self.commutator_A_f = nn.Linear(
+                self.in_channels, self.in_channels, bias=False
+            )
+            nn.init.eye_(self.commutator_A_t.weight)
+            nn.init.eye_(self.commutator_A_f.weight)
+        else:
+            self.commutator_A_t = None
+            self.commutator_A_f = None
+
         self.beta_dpo = 2000  ## this is used for dpo training
+
+    @property
+    def device(self):
+        parameter = next(self.parameters(), None)
+        if parameter is None:
+            return torch.device("cpu")
+        return parameter.device
+
+    def has_commutative_adapter(self):
+        return (
+            self.commutative_adapter_enabled
+            and self.commutator_A_t is not None
+            and self.commutator_A_f is not None
+        )
+
+    def get_adapter_parameters(self):
+        if not self.has_commutative_adapter():
+            return []
+        return list(self.commutator_A_t.parameters()) + list(
+            self.commutator_A_f.parameters()
+        )
+
+    def configure_trainable_parameters(self):
+        if self.commutative_adapter_enabled and not self.has_commutative_adapter():
+            raise ValueError(
+                "commutative_adapter.adapter_only requires commutative_adapter.enabled=true"
+            )
+
+        adapter_only_mode = (
+            self.has_commutative_adapter() and self.commutative_adapter_adapter_only
+        )
+
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+
+        for parameter in self.transformer.parameters():
+            parameter.requires_grad = not adapter_only_mode
+        for parameter in self.fc.parameters():
+            parameter.requires_grad = not adapter_only_mode
+        for parameter in self.get_adapter_parameters():
+            parameter.requires_grad = True
+
+    def get_optimizer_parameters(self):
+        return [parameter for parameter in self.parameters() if parameter.requires_grad]
+
+    def validate_adapter_only_trainable(self):
+        if not (
+            self.has_commutative_adapter() and self.commutative_adapter_adapter_only
+        ):
+            return
+
+        expected_trainable = {"commutator_A_t.weight", "commutator_A_f.weight"}
+        actual_trainable = {
+            name for name, parameter in self.named_parameters() if parameter.requires_grad
+        }
+        if actual_trainable != expected_trainable:
+            raise RuntimeError(
+                "Adapter-only mode expected trainable parameters {} but found {}".format(
+                    expected_trainable, actual_trainable
+                )
+            )
+
+    def apply_commutative_adapter(self, hidden_states):
+        if not self.has_commutative_adapter():
+            return hidden_states
+
+        x_tf = self.commutator_A_t(self.commutator_A_f(hidden_states))
+        x_ft = self.commutator_A_f(self.commutator_A_t(hidden_states))
+        return hidden_states + self.commutative_adapter_residual_scale * 0.5 * (
+            x_tf + x_ft
+        )
+
+    def compute_commutative_loss(self):
+        if not self.has_commutative_adapter():
+            parameter = next(self.parameters(), None)
+            if parameter is None:
+                return torch.tensor(0.0)
+            return parameter.new_zeros(())
+
+        weight_t = self.commutator_A_t.weight
+        weight_f = self.commutator_A_f.weight
+        comm_matrix = (weight_t @ weight_f) - (weight_f @ weight_t)
+        return torch.sum(comm_matrix ** 2)
 
     def get_sigmas(self, timesteps, n_dim=3, dtype=torch.float32):
         device = self.text_encoder.device
@@ -322,14 +429,16 @@ class TangoFlux(nn.Module):
         else:
 
             encoder_hidden_states, boolean_encoder_mask = self.encode_text(
-                prompt, num_samples_per_prompt=num_samples_per_prompt
+                prompt
             )
 
         mask_expanded = boolean_encoder_mask.unsqueeze(-1).expand_as(
             encoder_hidden_states
         )
         masked_data = torch.where(
-            mask_expanded, encoder_hidden_states, torch.tensor(float("nan"))
+            mask_expanded,
+            encoder_hidden_states,
+            encoder_hidden_states.new_full(encoder_hidden_states.shape, float("nan")),
         )
 
         pooled = torch.nanmean(masked_data, dim=1)
@@ -344,8 +453,9 @@ class TangoFlux(nn.Module):
             scheduler, num_inference_steps, device, timesteps, sigmas
         )
 
-        latents = torch.randn(num_samples_per_prompt, self.audio_seq_len, 64)
-        weight_dtype = latents.dtype
+        latents = torch.randn(
+            num_samples_per_prompt, self.audio_seq_len, self.in_channels
+        )
 
         progress_bar = tqdm(range(num_inference_steps), disable=disable_progress)
 
@@ -367,6 +477,7 @@ class TangoFlux(nn.Module):
             latents_input = (
                 torch.cat([latents] * 2) if classifier_free_guidance else latents
             )
+            latents_input = self.apply_commutative_adapter(latents_input)
 
             noise_pred = self.transformer(
                 hidden_states=latents_input,
@@ -408,7 +519,9 @@ class TangoFlux(nn.Module):
             encoder_hidden_states
         )
         masked_data = torch.where(
-            mask_expanded, encoder_hidden_states, torch.tensor(float("nan"))
+            mask_expanded,
+            encoder_hidden_states,
+            encoder_hidden_states.new_full(encoder_hidden_states.shape, float("nan")),
         )
         pooled = torch.nanmean(masked_data, dim=1)
         pooled_projection = self.fc(pooled)
@@ -451,6 +564,7 @@ class TangoFlux(nn.Module):
             sigmas = self.get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
 
             noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
+            noisy_model_input = self.apply_commutative_adapter(noisy_model_input)
 
             model_pred = self.transformer(
                 hidden_states=noisy_model_input,
@@ -471,12 +585,14 @@ class TangoFlux(nn.Module):
                 ),
                 1,
             )
-            loss = loss.mean()
+            flow_loss = loss.mean()
+            comm_loss = self.compute_commutative_loss()
+            loss = flow_loss + self.lambda_comm * comm_loss
             raw_model_loss, raw_ref_loss, implicit_acc = (
+                flow_loss,
+                comm_loss,
                 0,
-                0,
-                0,
-            )  ## default this to 0 if doing sft
+            )
 
         else:
             encoder_hidden_states = encoder_hidden_states.repeat(2, 1, 1)
@@ -500,6 +616,7 @@ class TangoFlux(nn.Module):
             sigmas = self.get_sigmas(timesteps, n_dim=latents.ndim, dtype=latents.dtype)
 
             noisy_model_input = (1.0 - sigmas) * latents + sigmas * noise
+            noisy_model_input = self.apply_commutative_adapter(noisy_model_input)
 
             model_pred = self.transformer(
                 hidden_states=noisy_model_input,

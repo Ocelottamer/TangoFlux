@@ -29,8 +29,11 @@ model:
   max_duration: 30
   uncondition: false
   text_encoder_name: "google/flan-t5-large"
-  
-
+  commutative_adapter:
+    enabled: false
+    adapter_only: true
+    residual_scale: 0.1
+    lambda_comm: 1.0e-4
 
 
 

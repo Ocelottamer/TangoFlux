@@ -7,14 +7,8 @@ from tangoflux import model as model_module
 from tangoflux.model import TangoFlux
 
 
-class DummyTextEncoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self._device_anchor = nn.Parameter(torch.zeros(1))
-
-    @property
-    def device(self):
-        return self._device_anchor.device
+class DummyTextEncoder:
+    device = torch.device("cpu")
 
 
 class DummyTransformer(nn.Module):
@@ -140,6 +134,7 @@ def test_adapter_only_smoke_step_runs_forward_backward_and_optimizer_step(monkey
     assert torch.isfinite(loss)
     assert torch.isfinite(flow_loss)
     assert torch.isfinite(comm_loss)
+    assert torch.isclose(loss, flow_loss + (model.lambda_comm * comm_loss))
     assert model.commutator_A_t.weight.grad is not None
     assert model.commutator_A_f.weight.grad is not None
     assert model.transformer.scale.grad is None
@@ -148,3 +143,18 @@ def test_adapter_only_smoke_step_runs_forward_backward_and_optimizer_step(monkey
     optimizer.step()
 
     assert not torch.allclose(before_step, model.commutator_A_t.weight.detach())
+
+
+def test_strict_false_checkpoint_load_accepts_missing_adapter_weights():
+    model = build_lightweight_model(enabled=True, adapter_only=True)
+    state_dict = model.state_dict()
+    state_dict.pop("commutator_A_t.weight")
+    state_dict.pop("commutator_A_f.weight")
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+
+    assert set(incompatible.missing_keys) == {
+        "commutator_A_t.weight",
+        "commutator_A_f.weight",
+    }
+    assert incompatible.unexpected_keys == []
